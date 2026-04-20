@@ -65,4 +65,29 @@ router.get('/:node_id/action', authenticateDevice, async (req, res) => {
   }
 });
 
+router.get('/:node_id/config', authenticateDevice, async (req, res) => {
+  try {
+    // req.node is attached by authenticateDevice after validating the API key.
+    // We re-fetch only if somehow the middleware didn't populate it (defensive).
+    const node = req.node
+      ?? (await NodeConfiguration.findOne({
+           node_id: req.params.node_id,
+           is_active: true,
+         }).lean());
+
+    if (!node) {
+      return res.status(404).json({ error: 'Node configuration not found.' });
+    }
+
+    return res.status(200).json({
+      node_id:                 node.node_id,
+      soil_moisture_threshold: node.soil_moisture_threshold,
+      servo_angle:             node.servo_angle,
+    });
+  } catch (err) {
+    console.error('Config fetch error:', err);
+    return res.status(500).json({ error: 'Failed to retrieve node configuration.' });
+  }
+});
+
 module.exports = router;
