@@ -5,7 +5,7 @@ const User = require('../models/User');
 const { authenticateJWT } = require('../middleware/auth');
 
 const signToken = (userId) =>
-  jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+  jwt.sign({ id: userId }, process.env.JWT_SECRET || "JWT_SECRET=218669ba2985e5ccfe07ac7a66131c2dc5aa089af4526b5d4da417a172802ba03cd0853305d4bfa587c50427cc8658fbff3e9bae9b2d34e63de4d6b45da7271c", {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d',
   });
 
