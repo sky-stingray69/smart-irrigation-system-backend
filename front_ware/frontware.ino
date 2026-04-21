@@ -59,6 +59,9 @@ void setup() {
     esp_now_register_send_cb(OnDataSent);
     
     esp_now_peer_info_t peerInfo;
+
+    memset(&peerInfo,0,sizeof(peerInfo));
+
     memcpy(peerInfo.peer_addr, masterAddress, 6);
     peerInfo.channel = WIFI_CHANNEL; // Set the channel to match the Master  
     peerInfo.encrypt = false;
@@ -69,6 +72,7 @@ void setup() {
     }
 
     // 3. Gather Data
+    delay(2000);
     float h = dht.readHumidity(); 
     float t = dht.readTemperature();
     int rawMoisture = analogRead(MOISTURE_AO_PIN);
