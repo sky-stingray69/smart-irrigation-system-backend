@@ -367,6 +367,10 @@ export default function Home() {
       crop_type:                      fd.get("crop_type"),
       moisture_threshold_percent:     Number(fd.get("moisture_threshold")),
       irrigation_rate_liters_per_min: Number(fd.get("irrigation_rate")),
+      coordinates:                    {
+      lat: Number(fd.get("lattitude")),
+      lon: Number(fd.get("longitude"))
+      },
       ...(editingNode ? { is_active: fd.get("is_active") === "on" } : {}),
     };
 
@@ -554,6 +558,14 @@ export default function Home() {
                     <div style={styles.field}>
                         <label style={styles.label}>Threshold (%)</label>
                         <input type="number" name="moisture_threshold" defaultValue={editingNode?.moisture_threshold_percent ?? 40} style={styles.input} required />
+                    </div>
+                    <div style={styles.field}>
+                        <label style={styles.label}>lattitude</label>
+                        <input type="number" name="lattitude" defaultValue={editingNode?.lattitude ?? 40} style={styles.input} required />
+                    </div>
+                    <div style={styles.field}>
+                        <label style={styles.label}>longitude</label>
+                        <input type="number" name="longitude" defaultValue={editingNode?.longitude ?? 40} style={styles.input} required />
                     </div>
                   </div>
 

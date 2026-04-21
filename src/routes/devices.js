@@ -5,7 +5,7 @@ const NodeConfiguration = require('../models/NodeConfiguration');
 const { getIrrigationDecision } = require('../services/decisionEngine');
 const { authenticateDevice } = require('../middleware/auth');
 const { deviceRateLimiter } = require('../middleware/rateLimiter');
-
+const { getPredictedRainfall } = require('../services/weatherService');
 router.use(deviceRateLimiter);
 
 /**
@@ -83,15 +83,17 @@ router.get('/:node_id/config', authenticateDevice, async (req, res) => {
            node_id: req.params.node_id,
            is_active: true,
          }).lean());
-
+    const {latitude, longitude} = node.coordinates;
+    const predictedRainFall = await getPredictedRainfall(latitude, longitude);
     if (!node) {
       return res.status(404).json({ error: 'Node configuration not found.' });
     }
-
+    
     return res.status(200).json({
       node_id:                 node.node_id,
       soil_moisture_threshold: node.moisture_threshold_percent,
       slaves:                  node.slaves ?? [], 
+      predicted_rain:          predictedRainFall
     });
   } catch (err) {
     console.error('Config fetch error:', err);

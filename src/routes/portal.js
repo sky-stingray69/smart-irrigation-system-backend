@@ -88,10 +88,10 @@ router.get('/nodes/:node_id', async (req, res) => {
  * Returns a one-time API key — store it securely, it won't be shown again.
  */
 router.post('/nodes', requireRole('admin'), async (req, res) => {
-  const { node_id, location_name, crop_type, moisture_threshold_percent,
+  const { node_id, location_name, crop_type, coordinates,  moisture_threshold_percent,
           irrigation_rate_liters_per_min} = req.body;
 
-  if (!node_id || !location_name || !crop_type ) {
+  if (!node_id || !location_name || !crop_type || !coordinates || coordinates.lat == null || coordinates.lon == null ) {
     return res.status(400).json({
       error: 'Required fields: node_id, location_name, crop_type'
     });
@@ -106,6 +106,7 @@ router.post('/nodes', requireRole('admin'), async (req, res) => {
       node_id,
       location_name,
       crop_type,
+      coordinates,
       moisture_threshold_percent: moisture_threshold_percent ?? 40,
       irrigation_rate_liters_per_min: irrigation_rate_liters_per_min ?? 5.0,
       api_key_hash,
@@ -133,7 +134,7 @@ router.post('/nodes', requireRole('admin'), async (req, res) => {
 router.put('/nodes/:node_id', requireRole('admin'), async (req, res) => {
   const allowedUpdates = [
     'crop_type', 'moisture_threshold_percent', 'irrigation_rate_liters_per_min',
-    'location_name',  'is_active',
+    'location_name',  'is_active', 'coordinates'
   ];
 
   const updates = {};

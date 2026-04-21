@@ -5,6 +5,10 @@ const nodeConfigSchema = new mongoose.Schema(
     node_id: { type: String, required: true, unique: true, trim: true },
     location_name: { type: String, required: true, trim: true },
     crop_type: { type: String, required: true, trim: true },
+     coordinates: {
+      lat: { type: Number, required: true, min: -90, max: 90 },
+      lon: { type: Number, required: true, min: -180, max: 180 },
+    },
     moisture_threshold_percent: {
       type: Number,
       required: true,
