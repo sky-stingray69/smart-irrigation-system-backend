@@ -30,7 +30,7 @@ router.get('/sensors', async (req, res) => {
   if (start_time || end_time) {
     filter.timestamp = {};
     if (start_time) filter.timestamp.$gte = new Date(start_time);
-    if (end_time) filter.timestamp.$lte = new Date(end_time);
+    if (end_time)   filter.timestamp.$lte = new Date(end_time);
     if (isNaN(filter.timestamp.$gte) || isNaN(filter.timestamp.$lte)) {
       return res.status(400).json({ error: 'Invalid date format for start_time or end_time.' });
     }
@@ -89,11 +89,11 @@ router.get('/nodes/:node_id', async (req, res) => {
  */
 router.post('/nodes', requireRole('admin'), async (req, res) => {
   const { node_id, location_name, crop_type, moisture_threshold_percent,
-          irrigation_rate_liters_per_min, coordinates } = req.body;
+          irrigation_rate_liters_per_min} = req.body;
 
-  if (!node_id || !location_name || !crop_type || !coordinates?.lat || !coordinates?.lon) {
+  if (!node_id || !location_name || !crop_type ) {
     return res.status(400).json({
-      error: 'Required fields: node_id, location_name, crop_type, coordinates.lat, coordinates.lon',
+      error: 'Required fields: node_id, location_name, crop_type'
     });
   }
 
@@ -108,8 +108,8 @@ router.post('/nodes', requireRole('admin'), async (req, res) => {
       crop_type,
       moisture_threshold_percent: moisture_threshold_percent ?? 40,
       irrigation_rate_liters_per_min: irrigation_rate_liters_per_min ?? 5.0,
-      coordinates,
       api_key_hash,
+      slaves: [],
     });
 
     return res.status(201).json({
@@ -133,7 +133,7 @@ router.post('/nodes', requireRole('admin'), async (req, res) => {
 router.put('/nodes/:node_id', requireRole('admin'), async (req, res) => {
   const allowedUpdates = [
     'crop_type', 'moisture_threshold_percent', 'irrigation_rate_liters_per_min',
-    'location_name', 'coordinates', 'is_active',
+    'location_name',  'is_active',
   ];
 
   const updates = {};
@@ -149,7 +149,7 @@ router.put('/nodes/:node_id', requireRole('admin'), async (req, res) => {
     const node = await NodeConfiguration.findOneAndUpdate(
       { node_id: req.params.node_id },
       { $set: updates },
-      { new: true, runValidators: true, projection: { api_key_hash: 0 } }
+      { returnDocument: 'after', runValidators: true, projection: { api_key_hash: 0 } }
     );
     if (!node) return res.status(404).json({ error: 'Node not found.' });
     return res.status(200).json({ message: 'Node updated.', node });
@@ -168,7 +168,7 @@ router.delete('/nodes/:node_id', requireRole('admin'), async (req, res) => {
     const node = await NodeConfiguration.findOneAndUpdate(
       { node_id: req.params.node_id },
       { $set: { is_active: false } },
-      { new: true, projection: { api_key_hash: 0 } }
+      { returnDocument: 'after', projection: { api_key_hash: 0 } }
     );
     if (!node) return res.status(404).json({ error: 'Node not found.' });
     return res.status(200).json({ message: `Node '${req.params.node_id}' deactivated.` });
@@ -176,6 +176,133 @@ router.delete('/nodes/:node_id', requireRole('admin'), async (req, res) => {
     return res.status(500).json({ error: 'Failed to deactivate node.' });
   }
 });
+
+// ─── Slave Configuration ──────────────────────────────────────────────────────
+//
+// Slaves are stored as an embedded array inside each NodeConfiguration document:
+//   slaves: [{ slave_id: String, angle: Number (0–180) }]
+//
+// Make sure your NodeConfiguration Mongoose schema includes:
+//   slaves: [{
+//     slave_id: { type: String, required: true },
+//     angle:    { type: Number, required: true, min: 0, max: 180 },
+//   }]
+
+/**
+ * GET /api/v1/portal/nodes/:node_id/slaves
+ * List all slaves registered under a node.
+ */
+router.get('/nodes/:node_id/slaves', async (req, res) => {
+  try {
+    const node = await NodeConfiguration.findOne(
+      { node_id: req.params.node_id },
+      { slaves: 1 }
+    ).lean();
+    if (!node) return res.status(404).json({ error: 'Node not found.' });
+    const slaves = node.slaves ?? [];
+    return res.status(200).json({ count: slaves.length, slaves });
+  } catch (err) {
+    console.error('Slave list fetch error:', err);
+    return res.status(500).json({ error: 'Failed to retrieve slaves.' });
+  }
+});
+
+/**
+ * POST /api/v1/portal/nodes/:node_id/slaves
+ * Register a new slave under a node. Admin only.
+ * Body: { slave_id: string, angle: number (0–180) }
+ */
+router.post('/nodes/:node_id/slaves', requireRole('admin'), async (req, res) => {
+  const { slave_id, angle } = req.body;
+
+  if (!slave_id || angle == null) {
+    return res.status(400).json({ error: 'Required fields: slave_id, angle.' });
+  }
+  if (typeof angle !== 'number' || angle < 0 || angle > 180) {
+    return res.status(400).json({ error: 'angle must be a number between 0 and 180.' });
+  }
+
+  try {
+    // Reject if slave_id already exists on this node
+    const existing = await NodeConfiguration.findOne({
+      node_id: req.params.node_id,
+      'slaves.slave_id': slave_id,
+    });
+    if (existing) {
+      return res.status(409).json({ error: `Slave '${slave_id}' already exists on this node.` });
+    }
+
+    const node = await NodeConfiguration.findOneAndUpdate(
+      { node_id: req.params.node_id },
+      { $push: { slaves: { slave_id, angle } } },
+      { returnDocument: 'after', runValidators: true, projection: { api_key_hash: 0 } }
+    );
+    if (!node) return res.status(404).json({ error: 'Node not found.' });
+
+    // Return the validated input directly — no need to search the returned document,
+    // which may not have the slaves array if the field was missing on this doc in the DB.
+    return res.status(201).json({ message: 'Slave registered.', slave: { slave_id, angle } });
+  } catch (err) {
+    console.error('Slave creation error:', err);
+    return res.status(500).json({ error: 'Failed to register slave.' });
+  }
+});
+
+/**
+ * PUT /api/v1/portal/nodes/:node_id/slaves/:slave_id
+ * Update a slave's servo angle. Admin only.
+ * Body: { angle: number (0–180) }
+ */
+router.put('/nodes/:node_id/slaves/:slave_id', requireRole('admin'), async (req, res) => {
+  const { angle } = req.body;
+
+  if (angle == null) {
+    return res.status(400).json({ error: 'Required field: angle.' });
+  }
+  if (typeof angle !== 'number' || angle < 0 || angle > 180) {
+    return res.status(400).json({ error: 'angle must be a number between 0 and 180.' });
+  }
+
+  try {
+    const node = await NodeConfiguration.findOneAndUpdate(
+      { node_id: req.params.node_id, 'slaves.slave_id': req.params.slave_id },
+      { $set: { 'slaves.$.angle': angle } },
+      { returnDocument: 'after', runValidators: true, projection: { api_key_hash: 0 } }
+    );
+    if (!node) {
+      return res.status(404).json({ error: 'Node or slave not found.' });
+    }
+
+    return res.status(200).json({ message: 'Slave updated.', slave: { slave_id: req.params.slave_id, angle } });
+  } catch (err) {
+    console.error('Slave update error:', err);
+    return res.status(500).json({ error: 'Failed to update slave.' });
+  }
+});
+
+/**
+ * DELETE /api/v1/portal/nodes/:node_id/slaves/:slave_id
+ * Remove a slave from a node. Admin only.
+ */
+router.delete('/nodes/:node_id/slaves/:slave_id', requireRole('admin'), async (req, res) => {
+  try {
+    const node = await NodeConfiguration.findOneAndUpdate(
+      { node_id: req.params.node_id },
+      { $pull: { slaves: { slave_id: req.params.slave_id } } },
+      { returnDocument: 'after', projection: { api_key_hash: 0 } }
+    );
+    if (!node) return res.status(404).json({ error: 'Node not found.' });
+
+    return res.status(200).json({
+      message: `Slave '${req.params.slave_id}' removed from node '${req.params.node_id}'.`,
+    });
+  } catch (err) {
+    console.error('Slave deletion error:', err);
+    return res.status(500).json({ error: 'Failed to remove slave.' });
+  }
+});
+
+// ─── System Status ────────────────────────────────────────────────────────────
 
 /**
  * GET /api/v1/portal/system/status

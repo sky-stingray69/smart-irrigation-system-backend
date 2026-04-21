@@ -12,12 +12,16 @@ const char* WIFI_SSID = "Your_SSID";
 const char* WIFI_PASS = "Your_Password";
 const char* API_BASE  = "http://your-api-endpoint.com/api/v1/devices";
 
+// Master Credentials from Portal
+const char* MASTER_NODE_ID = "master_01";
+const char* MASTER_API_KEY = "your_secure_api_key_here";
+
 #define PUMP_PIN        12
 #define SERVO_PIN       13
 #define MAX_SLAVES      10
 #define MAX_QUEUE_SIZE  20
-#define SYNC_INTERVAL   3600000UL   
-#define FORCE_WATER_MS  86400000UL  
+#define SYNC_INTERVAL   3600000UL   // 1 hour
+#define FORCE_WATER_MS  86400000UL  // 24 h safety override
 
 Servo       waterDirector;
 Preferences prefs;
@@ -26,20 +30,17 @@ Preferences prefs;
 // Data Structures
 // ---------------------------------------------------------------------------
 
-// CRITICAL FIX: This struct must be identical on both Master and Slave
 struct SlaveTelemetry {
     int   slaveID;
     float humidity;
     float temperature;
-    float soilMoisture; 
+    float soilMoisture;
 };
 
 struct ZoneConfig {
     int   slaveID              = -1;
     int   servoAngle           = 90;
-    float moistureThreshold    = 40.0;  
-    char  cloudNodeId[48]      = "";    
-    char  apiKey[80]           = "";    
+    float moistureThreshold    = 40.0; 
 } zones[MAX_SLAVES];
 
 // CRITICAL FIX: Replaced std::queue with a thread-safe FreeRTOS queue
@@ -49,6 +50,7 @@ unsigned long lastShowerTime = 0;
 unsigned long lastCloudSync  = 0;
 
 // ---------------------------------------------------------------------------
+// 1. NVS Persistence
 // 1. NVS Persistence
 // ---------------------------------------------------------------------------
 void saveCache() {
@@ -72,9 +74,17 @@ void loadCache() {
         lastShowerTime = prefs.getULong("lastWater", 0);
         Serial.println(">> NVS cache loaded.");
     }
+    prefs.begin("irrigate", true);
+    if (prefs.getBytes("zones", zones, sizeof(zones)) == 0) {
+        Serial.println(">> No NVS cache found, using defaults.");
+    }
+    lastShowerTime = prefs.getULong("lastWater", 0);
     prefs.end();
 }
 
+// ---------------------------------------------------------------------------
+// 2. Helper
+// ---------------------------------------------------------------------------
 int findZoneIndex(int slaveID) {
     for (int i = 0; i < MAX_SLAVES; i++) {
         if (zones[i].slaveID == slaveID) return i;
@@ -83,13 +93,15 @@ int findZoneIndex(int slaveID) {
 }
 
 // ---------------------------------------------------------------------------
-// Cloud Functions (Unchanged)
+// 3. Cloud — POST telemetry (Unified Master Auth)
 // ---------------------------------------------------------------------------
-void postTelemetryToCloud(const SlaveTelemetry& data, int zoneIdx) {
+void postTelemetryToCloud(const SlaveTelemetry& data) {
     if (WiFi.status() != WL_CONNECTED) return;
     char url[160];
-    snprintf(url, sizeof(url), "%s/%s/telemetry", API_BASE, zones[zoneIdx].cloudNodeId);
-    StaticJsonDocument<128> doc;
+    snprintf(url, sizeof(url), "%s/%s/telemetry", API_BASE, MASTER_NODE_ID);
+
+    StaticJsonDocument<256> doc;
+    doc["slave_id"]      = data.slaveID; // Critical for backend multi-slave support
     doc["temperature"]   = data.temperature;
     doc["humidity"]      = data.humidity;
     doc["soil_moisture"] = data.soilMoisture;
@@ -98,74 +110,105 @@ void postTelemetryToCloud(const SlaveTelemetry& data, int zoneIdx) {
     HTTPClient http;
     http.begin(url);
     http.addHeader("Content-Type",  "application/json");
-    http.addHeader("Authorization", String("Bearer ") + zones[zoneIdx].apiKey);
+    http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY);
     http.setTimeout(4000);
     int code = http.POST(body);
-    if (code >= 200 && code < 300) Serial.printf("Telemetry uploaded  [%s]\n", zones[zoneIdx].cloudNodeId);
-    else Serial.printf("Telemetry upload failed [%s]\n", zones[zoneIdx].cloudNodeId);
+    if (code >= 200 && code < 300)
+        Serial.printf("Telemetry uploaded [Slave %d | HTTP %d]\n", data.slaveID, code);
+    else
+        Serial.printf("Telemetry upload failed: %s\n", http.errorToString(code).c_str());
+
     http.end();
 }
 
-void syncConfigFromCloud(int zoneIdx) {
+// ---------------------------------------------------------------------------
+// 4. Cloud — GET config (Parses Slaves Array)
+// ---------------------------------------------------------------------------
+void syncConfigFromCloud() {
     if (WiFi.status() != WL_CONNECTED) return;
     char url[160];
-    snprintf(url, sizeof(url), "%s/%s/config", API_BASE, zones[zoneIdx].cloudNodeId);
+    snprintf(url, sizeof(url), "%s/%s/config", API_BASE, MASTER_NODE_ID);
+
     HTTPClient http;
     http.begin(url);
-    http.addHeader("Authorization", String("Bearer ") + zones[zoneIdx].apiKey);
-    http.setTimeout(4000);
+    http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY);
+    http.setTimeout(5000);
+
     int code = http.GET();
     if (code == HTTP_CODE_OK) {
         String payload = http.getString();
-        StaticJsonDocument<128> doc;
+        DynamicJsonDocument doc(2048); // Larger buffer for slaves array
+
         if (!deserializeJson(doc, payload)) {
-            zones[zoneIdx].moistureThreshold = doc["soil_moisture_threshold"] | zones[zoneIdx].moistureThreshold;
-            zones[zoneIdx].servoAngle        = doc["servo_angle"]             | zones[zoneIdx].servoAngle;
+            float masterThreshold = doc["soil_moisture_threshold"] | 40.0;
+            JsonArray slavesArr = doc["slaves"].as<JsonArray>();
+
+            // Update internal zones based on what's configured in the cloud
+            int i = 0;
+            for (JsonObject s : slavesArr) {
+                if (i >= MAX_SLAVES) break;
+                
+                zones[i].slaveID = s["slave_id"] | -1;
+                zones[i].servoAngle = s["angle"] | 90;
+                zones[i].moistureThreshold = masterThreshold;
+                i++;
+            }
+            
+            saveCache();
+            Serial.println("Config synced successfully from Cloud.");
         }
+    } else {
+        Serial.printf("Config sync failed: %s — using cached NVS values.\n", http.errorToString(code).c_str());
     }
     http.end();
 }
 
-void syncAllZoneConfigs() {
-    for (int i = 0; i < MAX_SLAVES; i++) {
-        if (zones[i].slaveID != -1 && strlen(zones[i].cloudNodeId) > 0) syncConfigFromCloud(i);
-    }
-    saveCache();
-}
-
 // ---------------------------------------------------------------------------
-// Actuation
+// 5. Local Decision & Actuation
 // ---------------------------------------------------------------------------
 void executeIrrigation(const SlaveTelemetry& data) {
     int idx = findZoneIndex(data.slaveID);
-    if (idx == -1) return;
+    if (idx == -1) {
+        Serial.printf("Slave %d not in local config — ignoring.\n", data.slaveID);
+        return;
+    }
 
     float threshold  = zones[idx].moistureThreshold;
     int   angle      = zones[idx].servoAngle;
     bool  dryEnough  = (data.soilMoisture < threshold);
     bool  override24 = (millis() - lastShowerTime > FORCE_WATER_MS);
 
+    Serial.printf("Slave %d | moisture=%.1f%% | threshold=%.1f%% | 24h_override=%s\n",
+                data.slaveID, data.soilMoisture, threshold, override24 ? "YES" : "no");
+
     if (!dryEnough && !override24) {
-        postTelemetryToCloud(data, idx);
+        Serial.println("STANDBY — soil adequately moist.");
+        postTelemetryToCloud(data);
         return;
     }
 
+    if (override24 && !dryEnough)
+        Serial.println("ACTION — 24 h safety override triggered.");
+    else
+        Serial.println("ACTION — soil moisture below threshold.");
+
+    // Actuate
     waterDirector.write(angle);
-    delay(500);                        
+    delay(800); 
+
     digitalWrite(PUMP_PIN, HIGH);
-    
-    // Because we are using FreeRTOS queues, this 5-second delay is now safe!
-    // Incoming ESP-NOW messages will queue up in the background.
-    delay(5000);                       
+    delay(5000); 
     digitalWrite(PUMP_PIN, LOW);
 
     lastShowerTime = millis();
     saveCache();
-    postTelemetryToCloud(data, idx);
+
+    // Upload after actuation
+    postTelemetryToCloud(data);
 }
 
 // ---------------------------------------------------------------------------
-// ESP-NOW Callback
+// 6. ESP-NOW callback
 // ---------------------------------------------------------------------------
 void OnDataRecv(const uint8_t* mac, const uint8_t* inData, int len) {
     SlaveTelemetry incoming;
@@ -191,30 +234,38 @@ void setup() {
 
     loadCache();
 
-    WiFi.mode(WIFI_AP_STA);
+    WiFi.mode(WIFI_AP_STA); 
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.println("Wi-Fi connecting...");
 
     if (esp_now_init() == ESP_OK) {
         esp_now_register_recv_cb(OnDataRecv);
     } else {
+        Serial.println("ESP-NOW init failed.");
         ESP.restart();
     }
 
-    if (WiFi.waitForConnectResult(5000) == WL_CONNECTED) {
-        syncAllZoneConfigs();
+    // Initial Sync (Non-blocking-ish)
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) { delay(100); }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        syncConfigFromCloud();
         lastCloudSync = millis();
     }
 }
 
 void loop() {
-    SlaveTelemetry pkt;
-    // CRITICAL FIX: Pull from FreeRTOS queue (non-blocking)
-    if (xQueueReceive(telemetryQueue, &pkt, 0) == pdTRUE) {
-        executeIrrigation(pkt);   
+    // Process Telemetry
+    if (!telemetryQueue.empty()) {
+        SlaveTelemetry pkt = telemetryQueue.front();
+        telemetryQueue.pop();
+        executeIrrigation(pkt); 
     }
 
+    // Periodic Sync
     if (millis() - lastCloudSync >= SYNC_INTERVAL) {
-        syncAllZoneConfigs();
+        syncConfigFromCloud();
         lastCloudSync = millis();
     }
 }

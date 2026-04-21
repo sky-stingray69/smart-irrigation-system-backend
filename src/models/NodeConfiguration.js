@@ -18,12 +18,26 @@ const nodeConfigSchema = new mongoose.Schema(
       min: 0,
       default: 5.0,
     },
-    coordinates: {
-      lat: { type: Number, required: true, min: -90, max: 90 },
-      lon: { type: Number, required: true, min: -180, max: 180 },
-    },
     api_key_hash: { type: String, required: true },
     is_active: { type: Boolean, default: true },
+    
+    // ─── Slave Configuration ─────────────────────────────────────
+    // Array of embedded slave devices under this master node
+    slaves: [
+      {
+        slave_id: { 
+          type: String, 
+          required: true, 
+          trim: true 
+        },
+        angle: { 
+          type: Number, 
+          required: true, 
+          min: 0, 
+          max: 180 
+        },
+      },
+    ],
   },
   { timestamps: true }
 );

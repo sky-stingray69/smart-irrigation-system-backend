@@ -1,28 +1,30 @@
 const express = require('express');
 const router = express.Router();
 const SensorData = require('../models/SensorData');
+const NodeConfiguration = require('../models/NodeConfiguration');
 const { getIrrigationDecision } = require('../services/decisionEngine');
 const { authenticateDevice } = require('../middleware/auth');
 const { deviceRateLimiter } = require('../middleware/rateLimiter');
 
-// Apply rate limiter to all device routes
 router.use(deviceRateLimiter);
 
 /**
  * POST /api/v1/devices/:node_id/telemetry
- * ESP32 pushes sensor readings to the cloud.
+ * ESP32 Master pushes sensor readings for a specific slave.
  */
 router.post('/:node_id/telemetry', authenticateDevice, async (req, res) => {
   const { node_id } = req.params;
-  const { temperature, humidity, soil_moisture } = req.body;
+  // Included slave_id in the destructuring
+  const { slave_id, temperature, humidity, soil_moisture } = req.body;
 
-  // Validate payload
-  if (temperature == null || humidity == null || soil_moisture == null) {
+  // 1. Validate payload including slave_id
+  if (slave_id == null || temperature == null || humidity == null || soil_moisture == null) {
     return res.status(400).json({
-      error: 'Missing required fields: temperature, humidity, soil_moisture.',
+      error: 'Missing required fields: slave_id, temperature, humidity, soil_moisture.',
     });
   }
 
+  // 2. Type validation
   if (
     typeof temperature !== 'number' ||
     typeof humidity !== 'number' ||
@@ -31,20 +33,25 @@ router.post('/:node_id/telemetry', authenticateDevice, async (req, res) => {
     return res.status(400).json({ error: 'All sensor values must be numbers.' });
   }
 
+  // 3. Range validation
   if (humidity < 0 || humidity > 100 || soil_moisture < 0 || soil_moisture > 100) {
     return res.status(400).json({ error: 'humidity and soil_moisture must be between 0 and 100.' });
   }
 
   try {
+    // 4. Create record with slave_id in metadata
     await SensorData.create({
       timestamp: new Date(),
-      metadata: { node_id },
+      metadata: { 
+        node_id, 
+        slave_id // This enables granular querying per slave/zone
+      },
       temperature_c: temperature,
       humidity_percent: humidity,
       soil_moisture_percent: soil_moisture,
     });
 
-    return res.status(201).json({ message: 'Telemetry recorded.' });
+    return res.status(201).json({ message: `Telemetry recorded for slave ${slave_id}.` });
   } catch (err) {
     console.error('Telemetry write error:', err);
     return res.status(500).json({ error: 'Failed to store telemetry data.' });
@@ -65,10 +72,12 @@ router.get('/:node_id/action', authenticateDevice, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/v1/devices/:node_id/config
+ * ESP32 fetches its configuration including all slave servo angles.
+ */
 router.get('/:node_id/config', authenticateDevice, async (req, res) => {
   try {
-    // req.node is attached by authenticateDevice after validating the API key.
-    // We re-fetch only if somehow the middleware didn't populate it (defensive).
     const node = req.node
       ?? (await NodeConfiguration.findOne({
            node_id: req.params.node_id,
@@ -81,8 +90,8 @@ router.get('/:node_id/config', authenticateDevice, async (req, res) => {
 
     return res.status(200).json({
       node_id:                 node.node_id,
-      soil_moisture_threshold: node.soil_moisture_threshold,
-      servo_angle:             node.servo_angle,
+      soil_moisture_threshold: node.moisture_threshold_percent,
+      slaves:                  node.slaves ?? [], 
     });
   } catch (err) {
     console.error('Config fetch error:', err);
