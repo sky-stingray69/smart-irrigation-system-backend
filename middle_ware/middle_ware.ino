@@ -1,5 +1,6 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h> // Added to control Wi-Fi radio power states
 #include <ESP32Servo.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
@@ -8,33 +9,26 @@
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const char* WIFI_SSID = "Your_SSID";
-const char* WIFI_PASS = "Your_Password";
-const char* API_BASE  = "http://your-api-endpoint.com/api/v1/devices";
+const char* WIFI_SSID = "Meow"; 
+const char* WIFI_PASS = "nigga1234";
 
-// Master Credentials from Portal
-const char* MASTER_NODE_ID = "master_01";
-const char* MASTER_API_KEY = "your_secure_api_key_here";
+const char* API_BASE  = "http://10.241.255.121:5000/api/v1/devices"; 
 
-#define PUMP_PIN        12
+const char* MASTER_NODE_ID = "8";
+const char* MASTER_API_KEY = "a0419561cbd1f16bc22278d21f2997c4beee65a227e9235a520fd4aae1f7f673";
+
 #define SERVO_PIN       13
 #define MAX_SLAVES      10
 #define MAX_QUEUE_SIZE  20
-#define SYNC_INTERVAL   3600000UL   // 1 hour
-#define FORCE_WATER_MS  86400000UL  // 24 h safety override
+#define SYNC_INTERVAL   3600000UL   
+#define FORCE_WATER_MS  86400000UL  
 
 Servo       waterDirector;
 Preferences prefs;
 
-// ---------------------------------------------------------------------------
-// Data Structures
-// ---------------------------------------------------------------------------
-
 struct SlaveTelemetry {
     int   slaveID;
-    float humidity;
-    float temperature;
-    float soilMoisture;
+    float humidity, temperature, soilMoisture;
 };
 
 struct ZoneConfig {
@@ -43,48 +37,56 @@ struct ZoneConfig {
     float moistureThreshold    = 40.0; 
 } zones[MAX_SLAVES];
 
-// CRITICAL FIX: Replaced std::queue with a thread-safe FreeRTOS queue
 QueueHandle_t telemetryQueue; 
-
 unsigned long lastShowerTime = 0;
 unsigned long lastCloudSync  = 0;
+int currentServoAngle        = 90; 
+
+float globalPredictedRain = 0.0;
 
 // ---------------------------------------------------------------------------
-// 1. NVS Persistence
-// 1. NVS Persistence
+// Helper Functions
 // ---------------------------------------------------------------------------
+void moveServoSlowly(int targetAngle) {
+    targetAngle = constrain(targetAngle, 0, 180);
+    Serial.printf("[SERVO] Initiating movement from %d° to %d°...\n", currentServoAngle, targetAngle);
+    
+    while (currentServoAngle != targetAngle) {
+        if (currentServoAngle < targetAngle) {
+            currentServoAngle++;
+        } else {
+            currentServoAngle--;
+        }
+        waterDirector.write(currentServoAngle);
+        delay(50); 
+    }
+    Serial.printf("[SERVO] Reached target angle: %d°\n", currentServoAngle);
+}
+
 void saveCache() {
+    Serial.println("[NVS] Attempting to save cache...");
     prefs.begin("irrigate", false);
-    prefs.putBytes("zones",     zones,         sizeof(zones));
+    prefs.putBytes("zones", zones, sizeof(zones));
     prefs.putULong("lastWater", lastShowerTime);
     prefs.end();
-    Serial.println(">> NVS cache saved.");
+    Serial.println("[NVS] Cache saved successfully.");
 }
 
 void loadCache() {
-    prefs.begin("irrigate", false); // Open in Read/Write mode
-    
-    // CRITICAL FIX: Check if memory exists before reading
+    Serial.println("[NVS] Checking for existing cache...");
+    prefs.begin("irrigate", false);
     if (!prefs.isKey("zones")) {
-        Serial.println(">> First boot detected. Initializing NVS cache.");
+        Serial.println("[NVS] No existing cache found. Initializing defaults.");
         prefs.putBytes("zones", zones, sizeof(zones));
         prefs.putULong("lastWater", 0);
     } else {
         prefs.getBytes("zones", zones, sizeof(zones));
         lastShowerTime = prefs.getULong("lastWater", 0);
-        Serial.println(">> NVS cache loaded.");
+        Serial.println("[NVS] Existing cache loaded successfully.");
     }
-    prefs.begin("irrigate", true);
-    if (prefs.getBytes("zones", zones, sizeof(zones)) == 0) {
-        Serial.println(">> No NVS cache found, using defaults.");
-    }
-    lastShowerTime = prefs.getULong("lastWater", 0);
     prefs.end();
 }
 
-// ---------------------------------------------------------------------------
-// 2. Helper
-// ---------------------------------------------------------------------------
 int findZoneIndex(int slaveID) {
     for (int i = 0; i < MAX_SLAVES; i++) {
         if (zones[i].slaveID == slaveID) return i;
@@ -93,179 +95,182 @@ int findZoneIndex(int slaveID) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Cloud — POST telemetry (Unified Master Auth)
+// Cloud Sync Function
 // ---------------------------------------------------------------------------
-void postTelemetryToCloud(const SlaveTelemetry& data) {
-    if (WiFi.status() != WL_CONNECTED) return;
-    char url[160];
-    snprintf(url, sizeof(url), "%s/%s/telemetry", API_BASE, MASTER_NODE_ID);
-
-    StaticJsonDocument<256> doc;
-    doc["slave_id"]      = data.slaveID; // Critical for backend multi-slave support
-    doc["temperature"]   = data.temperature;
-    doc["humidity"]      = data.humidity;
-    doc["soil_moisture"] = data.soilMoisture;
-    String body;
-    serializeJson(doc, body);
-    HTTPClient http;
-    http.begin(url);
-    http.addHeader("Content-Type",  "application/json");
-    http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY);
-    http.setTimeout(4000);
-    int code = http.POST(body);
-    if (code >= 200 && code < 300)
-        Serial.printf("Telemetry uploaded [Slave %d | HTTP %d]\n", data.slaveID, code);
-    else
-        Serial.printf("Telemetry upload failed: %s\n", http.errorToString(code).c_str());
-
-    http.end();
-}
-
-// ---------------------------------------------------------------------------
-// 4. Cloud — GET config (Parses Slaves Array)
-// ---------------------------------------------------------------------------
-void syncConfigFromCloud() {
-    if (WiFi.status() != WL_CONNECTED) return;
-    char url[160];
-    snprintf(url, sizeof(url), "%s/%s/config", API_BASE, MASTER_NODE_ID);
+void fetchConfigFromServer() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[HTTP] Cannot fetch config. WiFi not connected.");
+        return;
+    }
 
     HTTPClient http;
+    String url = String(API_BASE) + "/" + String(MASTER_NODE_ID) + "/config";
+    Serial.printf("\n[HTTP] GET Request to: %s\n", url.c_str());
+
     http.begin(url);
-    http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY);
-    http.setTimeout(5000);
+    http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY); 
 
-    int code = http.GET();
-    if (code == HTTP_CODE_OK) {
-        String payload = http.getString();
-        DynamicJsonDocument doc(2048); // Larger buffer for slaves array
+    int httpCode = http.GET();
 
-        if (!deserializeJson(doc, payload)) {
-            float masterThreshold = doc["soil_moisture_threshold"] | 40.0;
-            JsonArray slavesArr = doc["slaves"].as<JsonArray>();
-
-            // Update internal zones based on what's configured in the cloud
-            int i = 0;
-            for (JsonObject s : slavesArr) {
-                if (i >= MAX_SLAVES) break;
-                
-                zones[i].slaveID = s["slave_id"] | -1;
-                zones[i].servoAngle = s["angle"] | 90;
-                zones[i].moistureThreshold = masterThreshold;
-                i++;
-            }
+    if (httpCode > 0) {
+        Serial.printf("[HTTP] Response Code: %d\n", httpCode);
+        
+        if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+            String payload = http.getString();
             
-            saveCache();
-            Serial.println("Config synced successfully from Cloud.");
+            JsonDocument doc; 
+            DeserializationError error = deserializeJson(doc, payload);
+
+            if (error) {
+                Serial.printf("[JSON] Deserialization failed: %s\n", error.c_str());
+                http.end();
+                return;
+            }
+
+            float threshold = doc["soil_moisture_threshold"] | 40.0;
+            globalPredictedRain = doc["predicted_rain"] | 0.0;
+            
+            Serial.printf("[CONFIG] Global Threshold: %.1f%%\n", threshold);
+            Serial.printf("[CONFIG] Predicted Rain: %.1f mm\n", globalPredictedRain);
+
+            JsonArray slavesArray = doc["slaves"].as<JsonArray>();
+            Serial.printf("[CONFIG] Processing %d slaves from config.\n", slavesArray.size());
+            
+            for (JsonObject slaveObj : slavesArray) {
+                int slaveId = slaveObj["slave_id"];
+                int servoAngle = slaveObj["servo_angle"]; 
+                
+                int idx = findZoneIndex(slaveId);
+                
+                if (idx == -1) {
+                    for (int i = 0; i < MAX_SLAVES; i++) {
+                        if (zones[i].slaveID == -1) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                }
+                
+                if (idx != -1) {
+                    zones[idx].slaveID = slaveId;
+                    zones[idx].servoAngle = servoAngle;
+                    zones[idx].moistureThreshold = threshold;
+                    Serial.printf("   -> [ZONE UPDATE] Slot %d | Slave %d | Angle %d° | Thresh %.1f%%\n", 
+                                  idx, slaveId, servoAngle, threshold);
+                } else {
+                    Serial.println("   -> [WARNING] Zone array is full! Cannot add new slave.");
+                }
+            }
+            saveCache(); 
+        } else {
+            Serial.printf("[HTTP] Failed payload: %s\n", http.getString().c_str());
         }
     } else {
-        Serial.printf("Config sync failed: %s — using cached NVS values.\n", http.errorToString(code).c_str());
+        Serial.printf("[HTTP] Request failed, error: %s\n", http.errorToString(httpCode).c_str());
     }
     http.end();
 }
 
 // ---------------------------------------------------------------------------
-// 5. Local Decision & Actuation
+// Radio Callback
 // ---------------------------------------------------------------------------
-void executeIrrigation(const SlaveTelemetry& data) {
-    int idx = findZoneIndex(data.slaveID);
-    if (idx == -1) {
-        Serial.printf("Slave %d not in local config — ignoring.\n", data.slaveID);
-        return;
-    }
-
-    float threshold  = zones[idx].moistureThreshold;
-    int   angle      = zones[idx].servoAngle;
-    bool  dryEnough  = (data.soilMoisture < threshold);
-    bool  override24 = (millis() - lastShowerTime > FORCE_WATER_MS);
-
-    Serial.printf("Slave %d | moisture=%.1f%% | threshold=%.1f%% | 24h_override=%s\n",
-                data.slaveID, data.soilMoisture, threshold, override24 ? "YES" : "no");
-
-    if (!dryEnough && !override24) {
-        Serial.println("STANDBY — soil adequately moist.");
-        postTelemetryToCloud(data);
-        return;
-    }
-
-    if (override24 && !dryEnough)
-        Serial.println("ACTION — 24 h safety override triggered.");
-    else
-        Serial.println("ACTION — soil moisture below threshold.");
-
-    // Actuate
-    waterDirector.write(angle);
-    delay(800); 
-
-    digitalWrite(PUMP_PIN, HIGH);
-    delay(5000); 
-    digitalWrite(PUMP_PIN, LOW);
-
-    lastShowerTime = millis();
-    saveCache();
-
-    // Upload after actuation
-    postTelemetryToCloud(data);
-}
-
-// ---------------------------------------------------------------------------
-// 6. ESP-NOW callback
-// ---------------------------------------------------------------------------
-void OnDataRecv(const uint8_t* mac, const uint8_t* inData, int len) {
+void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * inData, int len) {
     SlaveTelemetry incoming;
     if (len == sizeof(incoming)) {
         memcpy(&incoming, inData, sizeof(incoming));
-        // CRITICAL FIX: Send to queue from an Interrupt Service Routine context
         xQueueSendFromISR(telemetryQueue, &incoming, NULL);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Setup & Loop
+// Setup
 // ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n=================================");
+    Serial.println("--- MASTER NODE INITIALIZING ---");
+    Serial.println("=================================");
 
-    // Initialize the FreeRTOS queue
+    Serial.println("[WIFI] Setting up WiFi as AP_STA...");
+    WiFi.mode(WIFI_AP_STA); 
+
+    // CRITICAL FIX: Disable Wi-Fi power saving so it doesn't miss ESP-NOW packets
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    Serial.println("[SYSTEM] Creating telemetry queue...");
     telemetryQueue = xQueueCreate(MAX_QUEUE_SIZE, sizeof(SlaveTelemetry));
 
-    pinMode(PUMP_PIN, OUTPUT);
-    digitalWrite(PUMP_PIN, LOW);
-    waterDirector.attach(SERVO_PIN);
+    Serial.println("[DIAG] Attaching servo to Pin 13...");
+    waterDirector.setPeriodHertz(50);
+    waterDirector.attach(SERVO_PIN, 500, 2400); 
+    
+    waterDirector.write(currentServoAngle); 
+    delay(1000);
+    
+    Serial.println("[DIAG] Sweeping servo to 0°...");
+    moveServoSlowly(0);
+    delay(1000);
+    
+    Serial.println("[DIAG] Sweeping servo back to 90°...");
+    moveServoSlowly(90);
+    Serial.println("[DIAG] Servo test finished.");
 
     loadCache();
 
-    WiFi.mode(WIFI_AP_STA); 
+    Serial.printf("[WIFI] Attempting connection to SSID: %s\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.println("Wi-Fi connecting...");
+    
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) { 
+        Serial.print(".");
+        delay(500); 
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("\n[WIFI] Connected! IP Address: ");
+        Serial.println(WiFi.localIP());
+        Serial.print("[WIFI] Master MAC Address: ");
+        Serial.println(WiFi.macAddress());
+        Serial.printf("[WIFI] Operating on Channel: %d\n", WiFi.channel()); // READ THIS VALUE
+        
+        fetchConfigFromServer();
+        lastCloudSync = millis();
+    } else {
+        Serial.println("\n[WIFI] WARNING: Connection timed out. Running without router connection.");
+    }
 
+    Serial.println("[ESPNOW] Initializing ESP-NOW...");
     if (esp_now_init() == ESP_OK) {
+        Serial.println("[ESPNOW] Init successful. Registering callback.");
         esp_now_register_recv_cb(OnDataRecv);
     } else {
-        Serial.println("ESP-NOW init failed.");
+        Serial.println("[ESPNOW] FATAL ERROR: Init failed. Restarting ESP32...");
+        delay(3000);
         ESP.restart();
     }
 
-    // Initial Sync (Non-blocking-ish)
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) { delay(100); }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        syncConfigFromCloud();
-        lastCloudSync = millis();
-    }
+    Serial.println("--- MASTER SETUP COMPLETE ---");
 }
 
+// ---------------------------------------------------------------------------
+// Main Loop
+// ---------------------------------------------------------------------------
 void loop() {
-    // Process Telemetry
-    if (!telemetryQueue.empty()) {
-        SlaveTelemetry pkt = telemetryQueue.front();
-        telemetryQueue.pop();
-        executeIrrigation(pkt); 
+    SlaveTelemetry pkt;
+    
+    if (xQueueReceive(telemetryQueue, &pkt, 0) == pdTRUE) {
+        Serial.println("\n[DATA RECV] ---------------------");
+        Serial.printf("   Slave ID : %d\n", pkt.slaveID);
+        Serial.printf("   Temp     : %.2f C\n", pkt.temperature);
+        Serial.printf("   Humidity : %.2f %%\n", pkt.humidity);
+        Serial.printf("   Moisture : %.2f %%\n", pkt.soilMoisture);
+        Serial.println("---------------------------------");
     }
 
-    // Periodic Sync
-    if (millis() - lastCloudSync >= SYNC_INTERVAL) {
-        syncConfigFromCloud();
+    if (WiFi.status() == WL_CONNECTED && millis() - lastCloudSync > SYNC_INTERVAL) {
+        Serial.println("\n[SYSTEM] Initiating scheduled cloud sync...");
+        fetchConfigFromServer();
         lastCloudSync = millis();
     }
 }
