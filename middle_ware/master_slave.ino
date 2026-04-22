@@ -1,6 +1,6 @@
 #include <esp_now.h>
 #include <WiFi.h>
-#include <esp_wifi.h> // Added to control Wi-Fi radio power states
+#include <esp_wifi.h> 
 #include <ESP32Servo.h>
 #include <Preferences.h>
 #include <HTTPClient.h>
@@ -20,8 +20,10 @@ const char* MASTER_API_KEY = "a0419561cbd1f16bc22278d21f2997c4beee65a227e9235a52
 #define SERVO_PIN       13
 #define MAX_SLAVES      10
 #define MAX_QUEUE_SIZE  20
-#define SYNC_INTERVAL   3600000UL   
-#define FORCE_WATER_MS  86400000UL  
+#define SYNC_INTERVAL   30000UL   
+
+#define WATERING_TIME_MS 2000  
+#define COOLDOWN_MS      15000 
 
 Servo       waterDirector;
 Preferences prefs;
@@ -38,18 +40,20 @@ struct ZoneConfig {
 } zones[MAX_SLAVES];
 
 QueueHandle_t telemetryQueue; 
-unsigned long lastShowerTime = 0;
 unsigned long lastCloudSync  = 0;
-int currentServoAngle        = 90; 
 
-float globalPredictedRain = 0.0;
+// THE BLACKLIST: Tracks the last time each slave was allowed into the queue
+unsigned long lastQueuedTime[MAX_SLAVES + 1] = {0}; 
+
+int currentServoAngle        = 0; 
+float globalPredictedRain    = 0.0;
 
 // ---------------------------------------------------------------------------
 // Helper Functions
 // ---------------------------------------------------------------------------
 void moveServoSlowly(int targetAngle) {
     targetAngle = constrain(targetAngle, 0, 180);
-    Serial.printf("[SERVO] Initiating movement from %d° to %d°...\n", currentServoAngle, targetAngle);
+    Serial.printf("[SERVO] Moving from %d° to %d°...\n", currentServoAngle, targetAngle);
     
     while (currentServoAngle != targetAngle) {
         if (currentServoAngle < targetAngle) {
@@ -58,31 +62,24 @@ void moveServoSlowly(int targetAngle) {
             currentServoAngle--;
         }
         waterDirector.write(currentServoAngle);
-        delay(50); 
+        delay(15); 
     }
-    Serial.printf("[SERVO] Reached target angle: %d°\n", currentServoAngle);
 }
 
 void saveCache() {
-    Serial.println("[NVS] Attempting to save cache...");
+    Serial.println("[NVS] Saving zone rules to memory...");
     prefs.begin("irrigate", false);
     prefs.putBytes("zones", zones, sizeof(zones));
-    prefs.putULong("lastWater", lastShowerTime);
     prefs.end();
-    Serial.println("[NVS] Cache saved successfully.");
 }
 
 void loadCache() {
-    Serial.println("[NVS] Checking for existing cache...");
+    Serial.println("[NVS] Loading zone rules from memory...");
     prefs.begin("irrigate", false);
     if (!prefs.isKey("zones")) {
-        Serial.println("[NVS] No existing cache found. Initializing defaults.");
         prefs.putBytes("zones", zones, sizeof(zones));
-        prefs.putULong("lastWater", 0);
     } else {
         prefs.getBytes("zones", zones, sizeof(zones));
-        lastShowerTime = prefs.getULong("lastWater", 0);
-        Serial.println("[NVS] Existing cache loaded successfully.");
     }
     prefs.end();
 }
@@ -95,7 +92,7 @@ int findZoneIndex(int slaveID) {
 }
 
 // ---------------------------------------------------------------------------
-// Cloud Sync Function
+// Cloud Sync Functions
 // ---------------------------------------------------------------------------
 void postTelemetryToCloud(const SlaveTelemetry& data) {
     if (WiFi.status() != WL_CONNECTED) return;
@@ -109,6 +106,7 @@ void postTelemetryToCloud(const SlaveTelemetry& data) {
     doc["soil_moisture"] = data.soilMoisture;
     String body;
     serializeJson(doc, body);
+    
     HTTPClient http;
     http.begin(url);
     http.addHeader("Content-Type",  "application/json");
@@ -125,14 +123,11 @@ void postTelemetryToCloud(const SlaveTelemetry& data) {
 }
 
 void fetchConfigFromServer() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[HTTP] Cannot fetch config. WiFi not connected.");
-        return;
-    }
+    if (WiFi.status() != WL_CONNECTED) return;
 
     HTTPClient http;
     String url = String(API_BASE) + "/" + String(MASTER_NODE_ID) + "/config";
-    Serial.printf("\n[HTTP] GET Request to: %s\n", url.c_str());
+    Serial.printf("\n[HTTP] Fetching config from: %s\n", url.c_str());
 
     http.begin(url);
     http.addHeader("Authorization", String("Bearer ") + MASTER_API_KEY); 
@@ -140,11 +135,8 @@ void fetchConfigFromServer() {
     int httpCode = http.GET();
 
     if (httpCode > 0) {
-        Serial.printf("[HTTP] Response Code: %d\n", httpCode);
-        
         if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
             String payload = http.getString();
-            
             JsonDocument doc; 
             DeserializationError error = deserializeJson(doc, payload);
 
@@ -157,15 +149,13 @@ void fetchConfigFromServer() {
             float threshold = doc["soil_moisture_threshold"] | 40.0;
             globalPredictedRain = doc["predicted_rain"] | 0.0;
             
-            Serial.printf("[CONFIG] Global Threshold: %.1f%%\n", threshold);
-            Serial.printf("[CONFIG] Predicted Rain: %.1f mm\n", globalPredictedRain);
+            Serial.printf("[CONFIG] Global Threshold: %.1f%% | Predicted Rain: %.1f mm\n", threshold, globalPredictedRain);
 
             JsonArray slavesArray = doc["slaves"].as<JsonArray>();
-            Serial.printf("[CONFIG] Processing %d slaves from config.\n", slavesArray.size());
             
             for (JsonObject slaveObj : slavesArray) {
                 int slaveId = slaveObj["slave_id"];
-                int servoAngle = slaveObj["servo_angle"]; 
+                int servoAngle = slaveObj["angle"]; 
                 
                 int idx = findZoneIndex(slaveId);
                 
@@ -182,30 +172,39 @@ void fetchConfigFromServer() {
                     zones[idx].slaveID = slaveId;
                     zones[idx].servoAngle = servoAngle;
                     zones[idx].moistureThreshold = threshold;
-                    Serial.printf("   -> [ZONE UPDATE] Slot %d | Slave %d | Angle %d° | Thresh %.1f%%\n", 
-                                  idx, slaveId, servoAngle, threshold);
-                } else {
-                    Serial.println("   -> [WARNING] Zone array is full! Cannot add new slave.");
+                    Serial.printf("   -> [ZONE] Slave %d | Directs to Angle %d°\n", slaveId, servoAngle);
                 }
             }
             saveCache(); 
-        } else {
-            Serial.printf("[HTTP] Failed payload: %s\n", http.getString().c_str());
         }
     } else {
-        Serial.printf("[HTTP] Request failed, error: %s\n", http.errorToString(httpCode).c_str());
+        Serial.printf("[HTTP] Config fetch failed, error: %s\n", http.errorToString(httpCode).c_str());
     }
     http.end();
 }
 
 // ---------------------------------------------------------------------------
-// Radio Callback
+// Radio Callback - THE BOUNCER
 // ---------------------------------------------------------------------------
 void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * inData, int len) {
     SlaveTelemetry incoming;
     if (len == sizeof(incoming)) {
         memcpy(&incoming, inData, sizeof(incoming));
-        xQueueSendFromISR(telemetryQueue, &incoming, NULL);
+
+        // 1. Validate ID is within array bounds to prevent crashes
+        if (incoming.slaveID >= 0 && incoming.slaveID <= MAX_SLAVES) {
+            
+            // 2. CHECK THE BLACKLIST
+            // If the current time minus the last time we let this slave in is less than the cooldown...
+            if (millis() - lastQueuedTime[incoming.slaveID] < COOLDOWN_MS) {
+                // Instantly drop the packet. Do not queue it. Do not pass go.
+                return; 
+            }
+            
+            // 3. If it passes, update the blacklist timer and add to queue
+            lastQueuedTime[incoming.slaveID] = millis();
+            xQueueSendFromISR(telemetryQueue, &incoming, NULL);
+        }
     }
 }
 
@@ -219,65 +218,43 @@ void setup() {
     Serial.println("--- MASTER NODE INITIALIZING ---");
     Serial.println("=================================");
 
-    Serial.println("[WIFI] Setting up WiFi as AP_STA...");
     WiFi.mode(WIFI_AP_STA); 
+    esp_wifi_set_ps(WIFI_PS_NONE); 
 
-    // CRITICAL FIX: Disable Wi-Fi power saving so it doesn't miss ESP-NOW packets
-    esp_wifi_set_ps(WIFI_PS_NONE);
-
-    Serial.println("[SYSTEM] Creating telemetry queue...");
     telemetryQueue = xQueueCreate(MAX_QUEUE_SIZE, sizeof(SlaveTelemetry));
 
-    Serial.println("[DIAG] Attaching servo to Pin 13...");
+    Serial.println("[DIAG] Attaching servo and pinching pipe (0°)...");
     waterDirector.setPeriodHertz(50);
     waterDirector.attach(SERVO_PIN, 500, 2400); 
-    
-    waterDirector.write(currentServoAngle); 
+    waterDirector.write(0); 
+    currentServoAngle = 0;
     delay(1000);
-    
-    Serial.println("[DIAG] Sweeping servo to 0°...");
-    moveServoSlowly(0);
-    delay(1000);
-    
-    Serial.println("[DIAG] Sweeping servo back to 90°...");
-    moveServoSlowly(90);
-    Serial.println("[DIAG] Servo test finished.");
 
     loadCache();
 
-    Serial.printf("[WIFI] Attempting connection to SSID: %s\n", WIFI_SSID);
+    Serial.printf("[WIFI] Connecting to SSID: %s\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) { 
-        Serial.print(".");
-        delay(500); 
+        Serial.print("."); delay(500); 
     }
     
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("\n[WIFI] Connected! IP Address: ");
-        Serial.println(WiFi.localIP());
-        Serial.print("[WIFI] Master MAC Address: ");
-        Serial.println(WiFi.macAddress());
-        Serial.printf("[WIFI] Operating on Channel: %d\n", WiFi.channel()); // READ THIS VALUE
-        
+        Serial.print("\n[WIFI] Connected! Channel: ");
+        Serial.println(WiFi.channel()); 
         fetchConfigFromServer();
         lastCloudSync = millis();
-    } else {
-        Serial.println("\n[WIFI] WARNING: Connection timed out. Running without router connection.");
     }
 
-    Serial.println("[ESPNOW] Initializing ESP-NOW...");
     if (esp_now_init() == ESP_OK) {
-        Serial.println("[ESPNOW] Init successful. Registering callback.");
         esp_now_register_recv_cb(OnDataRecv);
+        Serial.println("[ESPNOW] Listening for Virtual Slaves...");
     } else {
-        Serial.println("[ESPNOW] FATAL ERROR: Init failed. Restarting ESP32...");
-        delay(3000);
-        ESP.restart();
+        Serial.println("[ESPNOW] FATAL ERROR");
     }
 
-    Serial.println("--- MASTER SETUP COMPLETE ---");
+    pinMode(2, OUTPUT);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,17 +266,40 @@ void loop() {
     if (xQueueReceive(telemetryQueue, &pkt, 0) == pdTRUE) {
         Serial.println("\n[DATA RECV] ---------------------");
         Serial.printf("   Slave ID : %d\n", pkt.slaveID);
-        Serial.printf("   Temp     : %.2f C\n", pkt.temperature);
-        Serial.printf("   Humidity : %.2f %%\n", pkt.humidity);
         Serial.printf("   Moisture : %.2f %%\n", pkt.soilMoisture);
-        Serial.println("---------------------------------");
-
-        // Post the received data directly to your Express backend
+        
         postTelemetryToCloud(pkt);
+
+        int idx = findZoneIndex(pkt.slaveID);
+        if (idx != -1) {
+            float threshold = zones[idx].moistureThreshold;
+            int targetAngle = zones[idx].servoAngle;
+
+            if (pkt.soilMoisture < threshold && globalPredictedRain < 2.5) {
+                Serial.printf("   [ACTION] Soil is dry (%.1f%% < %.1f%%). Triggering watering cycle!\n", pkt.soilMoisture, threshold);
+                
+                digitalWrite(2, HIGH);
+                moveServoSlowly(targetAngle);
+                digitalWrite(2, LOW);
+
+                Serial.printf("   [ACTION] Water flowing to Slave %d for %d seconds...\n", pkt.slaveID, WATERING_TIME_MS / 1000);
+                delay(WATERING_TIME_MS);
+                
+                Serial.println("   [ACTION] Pinching pipe shut.");
+                moveServoSlowly(0);
+                
+            } else if (globalPredictedRain >= 2.5) {
+                Serial.printf("   [STANDBY] Expected rain (%.1f mm). Skipping watering to save water.\n", globalPredictedRain);
+            } else {
+                Serial.printf("   [STANDBY] Soil is adequately moist (%.1f%% >= %.1f%%).\n", pkt.soilMoisture, threshold);
+            }
+        } else {
+            Serial.println("   [WARNING] Slave ID not found in Master's configured zones!");
+        }
+        Serial.println("---------------------------------");
     }
 
     if (WiFi.status() == WL_CONNECTED && millis() - lastCloudSync > SYNC_INTERVAL) {
-        Serial.println("\n[SYSTEM] Initiating scheduled cloud sync...");
         fetchConfigFromServer();
         lastCloudSync = millis();
     }
