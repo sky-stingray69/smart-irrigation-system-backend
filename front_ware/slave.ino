@@ -18,6 +18,8 @@ const int moistPins[NUM_VIRTUAL_SLAVES]  = {32, 33, 34};
 DHT dht1(dhtPins[0], DHT11);
 DHT dht2(dhtPins[1], DHT11);
 DHT dht3(dhtPins[2], DHT11);
+
+// BUG 1 FIXED: Removed the stray "[]" at the end of this line
 DHT* dhtSensors[NUM_VIRTUAL_SLAVES] = {&dht1, &dht2, &dht3};
 
 struct SlaveTelemetry { 
@@ -98,7 +100,9 @@ void setup() {
 }
 
 void loop() {
-    if (packetsDelivered >= NUM_VIRTUAL_SLAVES || millis() > 1000) {
+    // BUG 2 FIXED: Changed timeout to 4000ms. 
+    // millis() starts at 0 on boot. Because setup() takes time, it is already > 1000 here!
+    if (packetsDelivered >= NUM_VIRTUAL_SLAVES || millis() > 4000) {
         if (packetsDelivered < NUM_VIRTUAL_SLAVES) {
             Serial.println("\n[ESPNOW] Timeout: Master missed some packets.");
         } else {
@@ -108,7 +112,9 @@ void loop() {
         Serial.println("[SYSTEM] Task complete. Entering 30s Deep Sleep...");
         Serial.flush();        
         esp_wifi_stop(); 
-        esp_sleep_enable_timer_wakeup(1000000ULL); 
+        
+        // BUG 3 FIXED: Multiplied by 30 to get 30 seconds (it was previously only sleeping for 1 sec)
+        esp_sleep_enable_timer_wakeup(30 * 1000000ULL); 
         esp_deep_sleep_start();
     }
 }
