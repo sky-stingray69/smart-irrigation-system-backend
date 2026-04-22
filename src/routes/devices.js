@@ -14,6 +14,7 @@ router.use(deviceRateLimiter);
  */
 router.post('/:node_id/telemetry', authenticateDevice, async (req, res) => {
   const { node_id } = req.params;
+  console.log(node_id);
   // Included slave_id in the destructuring
   const { slave_id, temperature, humidity, soil_moisture } = req.body;
 
@@ -24,7 +25,7 @@ router.post('/:node_id/telemetry', authenticateDevice, async (req, res) => {
     });
   }
 
-  // 2. Type validation
+  // 2. Type validationfalse
   if (
     typeof temperature !== 'number' ||
     typeof humidity !== 'number' ||
@@ -77,14 +78,19 @@ router.get('/:node_id/action', authenticateDevice, async (req, res) => {
  * ESP32 fetches its configuration including all slave servo angles.
  */
 router.get('/:node_id/config', authenticateDevice, async (req, res) => {
+  console.log("In config");
   try {
+
     const node = req.node
       ?? (await NodeConfiguration.findOne({
            node_id: req.params.node_id,
            is_active: true,
          }).lean());
-    const {latitude, longitude} = node.coordinates;
-    const predictedRainFall = await getPredictedRainfall(latitude, longitude);
+    console.log(node);
+    const {lat, lon} = node.coordinates;
+    console.log("lattitude is " + lat );
+    console.log("longitude is ", lon);
+    const predictedRainFall = await getPredictedRainfall(lat, lon);
     if (!node) {
       return res.status(404).json({ error: 'Node configuration not found.' });
     }

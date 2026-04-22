@@ -1,4 +1,5 @@
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 
 /**
  * Strict rate limiter for ESP32 device endpoints.
@@ -9,7 +10,7 @@ const deviceRateLimiter = rateLimit({
   max: parseInt(process.env.DEVICE_RATE_LIMIT_MAX) || 30,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => req.params.node_id || req.ip,
+  keyGenerator: (req) => req.params.node_id || ipKeyGenerator(req),
   message: {
     error: 'Too many requests from this device. Please slow down polling frequency.',
   },

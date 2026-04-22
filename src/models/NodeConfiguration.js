@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+
+
 const nodeConfigSchema = new mongoose.Schema(
   {
     node_id: { type: String, required: true, unique: true, trim: true },
@@ -45,5 +47,22 @@ const nodeConfigSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+nodeConfigSchema.pre('save', function() {
+  // If the document is being modified, and is_active is specifically being changed
+  if (this.isModified('is_active')) {
+    console.log("\n🚨 TRIPWIRE TRIGGERED: Node ${this.node_id} is_active changed to ${this.is_active}!");
+    console.trace("Stack trace showing what called this update:"); // This prints the exact file/function that did it
+  }
+
+});
+
+nodeConfigSchema.pre('findOneAndUpdate', function() {
+  const update = this.getUpdate();
+  if (update.is_active !== undefined || (update.$set && update.$set.is_active !== undefined)) {
+    console.log("\n🚨 TRIPWIRE TRIGGERED: findOneAndUpdate changing is_active!");
+  }
+ 
+});
 
 module.exports = mongoose.model('NodeConfiguration', nodeConfigSchema);

@@ -360,7 +360,7 @@ export default function Home() {
     setFormError("");
     setFormLoading(true);
     const fd = new FormData(e.target);
-
+    console.log(fd.get("is_active"))
     const payload = {
       node_id:                        fd.get("node_id"),
       location_name:                  fd.get("location_name"),
@@ -379,7 +379,7 @@ export default function Home() {
         ? `${API_BASE}/api/v1/portal/nodes/${editingNode.node_id}`
         : `${API_BASE}/api/v1/portal/nodes`;
       const method = editingNode ? "PUT" : "POST";
-
+      console.log("📤 Sending request:", { method, url, payload });
       const res  = await fetch(url, { method, headers: authHeaders(token), body: JSON.stringify(payload) });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Operation failed");
@@ -547,6 +547,19 @@ export default function Home() {
                       <label style={styles.label}>Node ID</label>
                       <input name="node_id" defaultValue={editingNode?.node_id} disabled={!!editingNode} style={{ ...styles.input, ...(editingNode ? styles.inputDisabled : {}) }} required />
                     </div>
+                    {editingNode && (
+                      <div style={{ ...styles.field, gridColumn: "span 2" }}>
+                        <label style={{ ...styles.label, display: "flex", alignItems: "center", gap: 8, fontWeight: 400 }}>
+                          <input 
+                            type="checkbox" 
+                            name="is_active" 
+                            defaultChecked={editingNode?.is_active}
+                            style={{ width: 16, height: 16, cursor: "pointer" }}
+                          />
+                          Active Node
+                        </label>
+                      </div>
+                    )}
                     <div style={styles.field}>
                       <label style={styles.label}>Location</label>
                       <input name="location_name" defaultValue={editingNode?.location_name} style={styles.input} required />
