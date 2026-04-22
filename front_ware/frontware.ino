@@ -1,107 +1,114 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h> 
 #include "DHT.h"
 
-// --- Configuration ---
-#define DHTPIN 5
-#define DHTTYPE DHT11
-#define MOISTURE_AO_PIN 32
-#define SLAVE_ID 1 
+// --- CRITICAL SETTINGS ---
+#define WIFI_CHANNEL 11 
+uint8_t masterAddress[] = {0x94, 0xB5, 0x55, 0x26, 0x8C, 0xF4}; 
 
-// CRITICAL FIX: You MUST set this to the Wi-Fi channel your home router uses. 
-// If your router is on Channel 6, set this to 6.
-#define WIFI_CHANNEL 6 
+#define NUM_VIRTUAL_SLAVES 3
 
-// Sleep Settings
-#define uS_TO_S_FACTOR 1000000ULL  
-#define TIME_TO_SLEEP  7200        
+// Arrays to hold the settings for each virtual slave
+const int slaveIDs[NUM_VIRTUAL_SLAVES]   = {1, 2, 3};
+const int dhtPins[NUM_VIRTUAL_SLAVES]    = {5, 18, 19};
+const int moistPins[NUM_VIRTUAL_SLAVES]  = {32, 33, 34};
 
-// REPLACE WITH YOUR MASTER'S MAC ADDRESS
-uint8_t masterAddress[] = {0xCC, 0xDB, 0xA7, 0x12, 0x34, 0x56}; 
+// Initialize the 3 DHT sensors
+DHT dht1(dhtPins[0], DHT11);
+DHT dht2(dhtPins[1], DHT11);
+DHT dht3(dhtPins[2], DHT11);
+DHT* dhtSensors[NUM_VIRTUAL_SLAVES] = {&dht1, &dht2, &dht3};
 
-DHT dht(DHTPIN, DHTTYPE);
-
-// CRITICAL FIX: Struct matches master exactly
-struct SlaveTelemetry {
-    int   slaveID;
-    float humidity;
-    float temperature;
-    float soilMoisture; 
+struct SlaveTelemetry { 
+    int slaveID; 
+    float humidity, temperature, soilMoisture; 
 } myData;
 
-// CRITICAL FIX: Flag to prevent going to sleep before transmission finishes
-volatile bool messageSent = false;
+volatile int packetsDelivered = 0;
 
-// Callback when data is sent
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    Serial.print("\r\nLast Packet Send Status:\t");
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-    messageSent = true; // Signal the main loop we can sleep now
+void OnDataSent(const esp_now_send_info_t * info, esp_now_send_status_t status) {
+    packetsDelivered++;
+    Serial.print("[ESPNOW] Delivery Status for a packet: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
 
 void setup() {
     Serial.begin(115200);
+    delay(1000); 
+    Serial.println("\n=================================");
+    Serial.println("--- MULTI-SLAVE NODE WAKING UP ---");
+    Serial.println("=================================");
     
-    // 1. Initialize Sensors
-    dht.begin();
-    pinMode(MOISTURE_AO_PIN, INPUT);
-
-    // 2. Setup WiFi & ESP-NOW
+    // Start all DHT sensors
+    for (int i = 0; i < NUM_VIRTUAL_SLAVES; i++) {
+        dhtSensors[i]->begin();
+    }
+    
     WiFi.mode(WIFI_STA);
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
     
     if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        // Don't just return, go back to sleep and try again later
-        esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-        esp_deep_sleep_start();
+        Serial.println("[ESPNOW] FATAL: Init Failed");
+        return;
     }
-
     esp_now_register_send_cb(OnDataSent);
-    
-    esp_now_peer_info_t peerInfo;
 
-    memset(&peerInfo,0,sizeof(peerInfo));
-
+    esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, masterAddress, 6);
-    peerInfo.channel = WIFI_CHANNEL; // Set the channel to match the Master  
-    peerInfo.encrypt = false;
+    peerInfo.channel = WIFI_CHANNEL;
+    peerInfo.encrypt = false; 
     
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add peer");
+        Serial.println("[ESPNOW] FATAL: Failed to add peer");
         return;
     }
 
-    // 3. Gather Data
-    delay(2000);
-    float h = dht.readHumidity(); 
-    float t = dht.readTemperature();
-    int rawMoisture = analogRead(MOISTURE_AO_PIN);
+    // --- LOOP THROUGH ALL 3 VIRTUAL SLAVES AND SEND DATA ---
+    for (int i = 0; i < NUM_VIRTUAL_SLAVES; i++) {
+        Serial.printf("\n[DATA] Reading Virtual Slave %d...\n", slaveIDs[i]);
+        
+        myData.slaveID = slaveIDs[i]; 
+        
+        float h = dhtSensors[i]->readHumidity();
+        float t = dhtSensors[i]->readTemperature();
+        
+        if (isnan(h) || isnan(t)) {
+            Serial.printf("   -> [SENSOR] Warning: DHT on pin %d failed! Sending 0.0\n", dhtPins[i]);
+            myData.humidity = 0.0;
+            myData.temperature = 0.0;
+        } else {
+            myData.humidity = h;
+            myData.temperature = t;
+        }
+        
+        // --- THE RAW DEBUGGER ---
+        int raw = analogRead(moistPins[i]);
+        Serial.printf("   -> [DEBUG] Pin %d Raw ADC Value: %d\n", moistPins[i], raw);
+        
+        myData.soilMoisture = constrain(map(raw, 4095, 1500, 0, 100), 0, 100);
 
-    float moisturePercent = map(rawMoisture, 4095, 1500, 0, 100);
-    moisturePercent = constrain(moisturePercent, 0, 100);
+        Serial.printf("   -> Sending [ID: %d] Temp: %.2f C, Hum: %.2f %%, Moist: %.2f %%\n", 
+                      myData.slaveID, myData.temperature, myData.humidity, myData.soilMoisture);
 
-    // 4. Prepare Struct (Correct Mapping)
-    myData.slaveID      = SLAVE_ID;
-    myData.humidity     = h;                // Was missing before
-    myData.temperature  = t;
-    myData.soilMoisture = moisturePercent;  // Was accidentally sent as humidity before
-
-    // 5. Send Data
-    esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));
+        esp_now_send(masterAddress, (uint8_t *) &myData, sizeof(myData));
+        
+        delay(100); 
+    }
 }
 
 void loop() {
-    // CRITICAL FIX: Wait for the radio to finish sending before sleeping
-    if (messageSent) {
-        Serial.println("Transmission complete. Entering Deep Sleep for 2 hours...");
-        esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-        esp_deep_sleep_start();
-    }
-    
-    // Fail-safe: If the callback never fires (e.g., radio glitch), sleep anyway after 1 second
-    if (millis() > 1000) {
-        Serial.println("Timeout waiting for transmission. Sleeping anyway...");
-        esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    if (packetsDelivered >= NUM_VIRTUAL_SLAVES || millis() > 1000) {
+        if (packetsDelivered < NUM_VIRTUAL_SLAVES) {
+            Serial.println("\n[ESPNOW] Timeout: Master missed some packets.");
+        } else {
+            Serial.println("\n[ESPNOW] All Virtual Slave packets successfully delivered!");
+        }
+        
+        Serial.println("[SYSTEM] Task complete. Entering 30s Deep Sleep...");
+        Serial.flush();        
+        esp_wifi_stop(); 
+        esp_sleep_enable_timer_wakeup(1000000ULL); 
         esp_deep_sleep_start();
     }
 }
