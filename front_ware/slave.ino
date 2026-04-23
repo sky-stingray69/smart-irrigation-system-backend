@@ -3,7 +3,14 @@
 #include <esp_wifi.h> 
 #include "DHT.h"
 
-// --- CRITICAL SETTINGS ---
+// ---------------------------------------------------------------------------
+// TIMING CONTROLS (Easily change these values)
+// ---------------------------------------------------------------------------
+#define DEEP_SLEEP_SECONDS 15  // How often the slave wakes up to send data
+
+// ---------------------------------------------------------------------------
+// CRITICAL SETTINGS
+// ---------------------------------------------------------------------------
 #define WIFI_CHANNEL 11 
 uint8_t masterAddress[] = {0x94, 0xB5, 0x55, 0x26, 0x8C, 0xF4}; 
 
@@ -18,8 +25,6 @@ const int moistPins[NUM_VIRTUAL_SLAVES]  = {32, 33, 34};
 DHT dht1(dhtPins[0], DHT11);
 DHT dht2(dhtPins[1], DHT11);
 DHT dht3(dhtPins[2], DHT11);
-
-// BUG 1 FIXED: Removed the stray "[]" at the end of this line
 DHT* dhtSensors[NUM_VIRTUAL_SLAVES] = {&dht1, &dht2, &dht3};
 
 struct SlaveTelemetry { 
@@ -42,7 +47,6 @@ void setup() {
     Serial.println("--- MULTI-SLAVE NODE WAKING UP ---");
     Serial.println("=================================");
     
-    // Start all DHT sensors
     for (int i = 0; i < NUM_VIRTUAL_SLAVES; i++) {
         dhtSensors[i]->begin();
     }
@@ -66,7 +70,6 @@ void setup() {
         return;
     }
 
-    // --- LOOP THROUGH ALL 3 VIRTUAL SLAVES AND SEND DATA ---
     for (int i = 0; i < NUM_VIRTUAL_SLAVES; i++) {
         Serial.printf("\n[DATA] Reading Virtual Slave %d...\n", slaveIDs[i]);
         
@@ -84,12 +87,17 @@ void setup() {
             myData.temperature = t;
         }
         
-        // --- THE RAW DEBUGGER ---
+        // --- PRO CALIBRATION: PIECEWISE INTERPOLATION ---
         int raw = analogRead(moistPins[i]);
         Serial.printf("   -> [DEBUG] Pin %d Raw ADC Value: %d\n", moistPins[i], raw);
         
-        myData.soilMoisture = constrain(map(raw, 4095, 1500, 0, 100), 0, 100);
-
+        if (raw >= 1726) {
+            // From Bone Dry (4095) to Sticky Clay (1726) -> Maps to 0% - 60%
+            myData.soilMoisture = constrain(map(raw, 4095, 1726, 0, 60), 0, 100);
+        } else {
+            // From Sticky Clay (1726) to Swamp (1390) -> Maps to 60% - 100%
+            myData.soilMoisture = constrain(map(raw, 1726, 1390, 60, 100), 0, 100);
+        }
         Serial.printf("   -> Sending [ID: %d] Temp: %.2f C, Hum: %.2f %%, Moist: %.2f %%\n", 
                       myData.slaveID, myData.temperature, myData.humidity, myData.soilMoisture);
 
@@ -100,21 +108,19 @@ void setup() {
 }
 
 void loop() {
-    // BUG 2 FIXED: Changed timeout to 4000ms. 
-    // millis() starts at 0 on boot. Because setup() takes time, it is already > 1000 here!
-    if (packetsDelivered >= NUM_VIRTUAL_SLAVES || millis() > 4000) {
+    if (packetsDelivered >= NUM_VIRTUAL_SLAVES || millis() > 3000) {
         if (packetsDelivered < NUM_VIRTUAL_SLAVES) {
             Serial.println("\n[ESPNOW] Timeout: Master missed some packets.");
         } else {
             Serial.println("\n[ESPNOW] All Virtual Slave packets successfully delivered!");
         }
         
-        Serial.println("[SYSTEM] Task complete. Entering 30s Deep Sleep...");
+        Serial.printf("[SYSTEM] Task complete. Entering %d-second Deep Sleep...\n", DEEP_SLEEP_SECONDS);
         Serial.flush();        
         esp_wifi_stop(); 
         
-        // BUG 3 FIXED: Multiplied by 30 to get 30 seconds (it was previously only sleeping for 1 sec)
-        esp_sleep_enable_timer_wakeup(30 * 1000000ULL); 
+        // Use the variable defined at the top
+        esp_sleep_enable_timer_wakeup(DEEP_SLEEP_SECONDS * 1000000ULL); 
         esp_deep_sleep_start();
     }
 }
