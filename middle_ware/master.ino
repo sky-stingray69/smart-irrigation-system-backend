@@ -7,6 +7,13 @@
 #include <ArduinoJson.h>
 
 // ---------------------------------------------------------------------------
+// TIMING CONTROLS (Easily change these values)
+// ---------------------------------------------------------------------------
+#define BOUNCER_BLACKLIST_MS 30000 // (30s) Drops packets from slaves heard recently
+#define WATERING_TIME_MS     2000  // (2s) How long the servo unpinches the pipe
+#define SYNC_INTERVAL_MS     30000 // (30s) How often to fetch rules from the database
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 const char* WIFI_SSID = "Meow"; 
@@ -20,10 +27,6 @@ const char* MASTER_API_KEY = "a0419561cbd1f16bc22278d21f2997c4beee65a227e9235a52
 #define SERVO_PIN       13
 #define MAX_SLAVES      10
 #define MAX_QUEUE_SIZE  20
-#define SYNC_INTERVAL   30000UL   
-
-#define WATERING_TIME_MS 2000  
-#define COOLDOWN_MS      15000 
 
 Servo       waterDirector;
 Preferences prefs;
@@ -191,17 +194,13 @@ void OnDataRecv(const esp_now_recv_info_t * info, const uint8_t * inData, int le
     if (len == sizeof(incoming)) {
         memcpy(&incoming, inData, sizeof(incoming));
 
-        // 1. Validate ID is within array bounds to prevent crashes
         if (incoming.slaveID >= 0 && incoming.slaveID <= MAX_SLAVES) {
             
-            // 2. CHECK THE BLACKLIST
-            // If the current time minus the last time we let this slave in is less than the cooldown...
-            if (millis() - lastQueuedTime[incoming.slaveID] < COOLDOWN_MS) {
-                // Instantly drop the packet. Do not queue it. Do not pass go.
+            // THE BLACKLIST LOGIC (Using the new variable)
+            if (lastQueuedTime[incoming.slaveID] != 0 && (millis() - lastQueuedTime[incoming.slaveID] < BOUNCER_BLACKLIST_MS)) {
                 return; 
             }
             
-            // 3. If it passes, update the blacklist timer and add to queue
             lastQueuedTime[incoming.slaveID] = millis();
             xQueueSendFromISR(telemetryQueue, &incoming, NULL);
         }
@@ -272,18 +271,25 @@ void loop() {
 
         int idx = findZoneIndex(pkt.slaveID);
         if (idx != -1) {
-            float threshold = zones[idx].moistureThreshold;
-            int targetAngle = zones[idx].servoAngle;
+            float baseThreshold = zones[idx].moistureThreshold;
+            float actualThreshold = baseThreshold;
+            int actualWateringTime = WATERING_TIME_MS;
 
-            if (pkt.soilMoisture < threshold && globalPredictedRain < 2.5) {
-                Serial.printf("   [ACTION] Soil is dry (%.1f%% < %.1f%%). Triggering watering cycle!\n", pkt.soilMoisture, threshold);
+            if (pkt.temperature > 35.0) {
+                actualThreshold = min(baseThreshold + 10.0f, 90.0f);
+                actualWateringTime += 2000; 
+                Serial.printf("   [SMART] Heatwave! Threshold adjusted: %.1f%% -> %.1f%%\n", baseThreshold, actualThreshold);
+            }
+
+            if (pkt.soilMoisture < actualThreshold && globalPredictedRain < 2.5) {
+                Serial.printf("   [ACTION] Soil is dry (%.1f%% < %.1f%%). Triggering watering cycle!\n", pkt.soilMoisture, actualThreshold);
                 
-                digitalWrite(2, HIGH);
-                moveServoSlowly(targetAngle);
-                digitalWrite(2, LOW);
+                digitalWrite(2, HIGH); 
+                moveServoSlowly(zones[idx].servoAngle);
+                digitalWrite(2, LOW);  
 
-                Serial.printf("   [ACTION] Water flowing to Slave %d for %d seconds...\n", pkt.slaveID, WATERING_TIME_MS / 1000);
-                delay(WATERING_TIME_MS);
+                Serial.printf("   [ACTION] Water flowing to Slave %d for %d seconds...\n", pkt.slaveID, actualWateringTime / 1000);
+                delay(actualWateringTime);
                 
                 Serial.println("   [ACTION] Pinching pipe shut.");
                 moveServoSlowly(0);
@@ -291,7 +297,7 @@ void loop() {
             } else if (globalPredictedRain >= 2.5) {
                 Serial.printf("   [STANDBY] Expected rain (%.1f mm). Skipping watering to save water.\n", globalPredictedRain);
             } else {
-                Serial.printf("   [STANDBY] Soil is adequately moist (%.1f%% >= %.1f%%).\n", pkt.soilMoisture, threshold);
+                Serial.printf("   [STANDBY] Soil is adequately moist (%.1f%% >= %.1f%%).\n", pkt.soilMoisture, actualThreshold);
             }
         } else {
             Serial.println("   [WARNING] Slave ID not found in Master's configured zones!");
@@ -299,7 +305,8 @@ void loop() {
         Serial.println("---------------------------------");
     }
 
-    if (WiFi.status() == WL_CONNECTED && millis() - lastCloudSync > SYNC_INTERVAL) {
+    // Use the variable defined at the top
+    if (WiFi.status() == WL_CONNECTED && millis() - lastCloudSync > SYNC_INTERVAL_MS) {
         fetchConfigFromServer();
         lastCloudSync = millis();
     }
